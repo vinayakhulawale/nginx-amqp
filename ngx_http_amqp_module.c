@@ -3,6 +3,7 @@
 #include <ngx_http.h>
 #include <ngx_md5.h>
 #include <amqp_tcp_socket.h>
+#include <amqp_ssl_socket.h>
 #include <amqp.h>
 #include <amqp_framing.h>
 #include <syslog.h>
@@ -12,18 +13,33 @@ typedef struct{
     ngx_str_t amqp_ip;
     ngx_uint_t amqp_port;
     ngx_str_t amqp_exchange;
-    ngx_str_t amqp_queue;
+    ngx_str_t amqp_routing_key;
     ngx_str_t amqp_user;
     ngx_str_t amqp_password;
     amqp_socket_t* socket;
     amqp_connection_state_t conn;
     ngx_uint_t init;
     ngx_uint_t amqp_debug;
+    ngx_uint_t amqp_ssl;
+    ngx_uint_t amqp_ssl_verify_peer;
+    ngx_uint_t amqp_ssl_verify_hostname;
+    ngx_str_t amqp_ssl_ca_certificate;
+    ngx_str_t amqp_ssl_client_certificate;
+    ngx_str_t amqp_ssl_client_certificate_key;
+    ngx_uint_t amqp_ssl_min_version;
+    ngx_uint_t amqp_ssl_max_version;
     ngx_str_t script_source;
     ngx_array_t* lengths;
     ngx_array_t* values;
 }ngx_http_amqp_conf_t;
 
+static ngx_conf_enum_t  amqp_ssl_version[] = {
+    { ngx_string("tlsv1"),   AMQP_TLSv1 },
+    { ngx_string("tlsv1.1"), AMQP_TLSv1_1 },
+    { ngx_string("tlsv1.2"), AMQP_TLSv1_2 },
+    { ngx_string("latest"),  AMQP_TLSvLATEST },
+    { ngx_null_string, 0 }
+};
 
 static void ngx_http_amqp_exit(ngx_cycle_t* cycle);
 static char * ngx_http_amqp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
@@ -66,11 +82,11 @@ static ngx_command_t ngx_http_amqp_commands[] = {
         NULL
     },
     {
-        ngx_string("amqp_queue"),
+        ngx_string("amqp_routing_key"),
         NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
         ngx_conf_set_str_slot,
         NGX_HTTP_LOC_CONF_OFFSET,
-        offsetof(ngx_http_amqp_conf_t, amqp_queue),
+        offsetof(ngx_http_amqp_conf_t, amqp_routing_key),
         NULL
     },
     {
@@ -97,12 +113,75 @@ static ngx_command_t ngx_http_amqp_commands[] = {
         offsetof(ngx_http_amqp_conf_t, amqp_debug),
         NULL
     },
+    {
+        ngx_string("amqp_ssl"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl),
+        NULL
+    },
+    {
+        ngx_string("amqp_ssl_verify_peer"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl_verify_peer),
+        NULL
+    },
+    {
+        ngx_string("amqp_ssl_verify_hostname"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_num_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl_verify_hostname),
+        NULL
+    },
+    {
+        ngx_string("amqp_ssl_ca_certificate"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl_ca_certificate),
+        NULL
+    },
+    {
+        ngx_string("amqp_ssl_client_certificate"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl_client_certificate),
+        NULL
+    },
+    {
+        ngx_string("amqp_ssl_client_certificate_key"),
+        NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+        ngx_conf_set_str_slot,
+        NGX_HTTP_LOC_CONF_OFFSET,
+        offsetof(ngx_http_amqp_conf_t, amqp_ssl_client_certificate_key),
+        NULL
+    },
+    { ngx_string("amqp_ssl_min_version"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_amqp_conf_t, amqp_ssl_min_version),
+      &amqp_ssl_version 
+    },
+    { ngx_string("amqp_ssl_max_version"),
+      NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_conf_set_enum_slot,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      offsetof(ngx_http_amqp_conf_t, amqp_ssl_max_version),
+      &amqp_ssl_version
+     },
     ngx_null_command
 };
 
+
 static ngx_http_module_t ngx_http_amqp_module_ctx = {
     NULL,                          /* preconfiguration */
-        NULL,                         /* postconfiguration */
+    NULL,                         /* postconfiguration */
 
     NULL,                          /* create main configuration */
     NULL,                          /* init main configuration */
@@ -141,7 +220,7 @@ int get_error(int x, u_char const *context, u_char* error)
 }
 
 
-int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
+int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char** error)
 {
     switch (x.reply_type) {
         case AMQP_RESPONSE_NORMAL:
@@ -149,12 +228,12 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
 
         case AMQP_RESPONSE_NONE:
         syslog(LOG_ERR, "%s: missing RPC reply type!", context);
-        ngx_sprintf(error, "%s: missing RPC reply type!\n", context);
+        ngx_sprintf(*error, "%s: missing RPC reply type!\n", context);
         break;
 
         case AMQP_RESPONSE_LIBRARY_EXCEPTION:
         syslog(LOG_ERR, "%s: %s", context, amqp_error_string2(x.library_error));
-        ngx_sprintf(error, "%s: %s\n", context, amqp_error_string2(x.library_error));
+        ngx_sprintf(*error, "%s: %s\n", context, amqp_error_string2(x.library_error));
         break;
 
         case AMQP_RESPONSE_SERVER_EXCEPTION:
@@ -165,7 +244,7 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
-                ngx_sprintf(error, "%s: server connection error %d, message: %.*s\n",
+                ngx_sprintf(*error, "%s: server connection error %d, message: %.*s\n",
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
@@ -177,7 +256,7 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
-                ngx_sprintf(error, "%s: server channel error %d, message: %.*s\n",
+                ngx_sprintf(*error, "%s: server channel error %d, message: %.*s\n",
                     context,
                     m->reply_code,
                     (int) m->reply_text.len, (char *) m->reply_text.bytes);
@@ -185,7 +264,7 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
             }
             default:
             syslog(LOG_ERR, "%s: unknown server error, method id 0x%08X", context, x.reply.id);
-            ngx_sprintf(error, "%s: unknown server error, method id 0x%08X\n", context, x.reply.id);
+            ngx_sprintf(*error, "%s: unknown server error, method id 0x%08X\n", context, x.reply.id);
             break;
         }
         break;
@@ -194,19 +273,58 @@ int get_amqp_error(amqp_rpc_reply_t x, u_char const *context, u_char* error)
     return 1;
 }
 
-int connect_amqp(ngx_http_amqp_conf_t* amcf, u_char* error){
+int connect_amqp(ngx_http_amqp_conf_t* amcf, u_char** error){
     int status;
     amqp_rpc_reply_t reply;
         //initialize connection and channel
     amcf->conn=amqp_new_connection();
-    amcf->socket=amqp_tcp_socket_new(amcf->conn);
-    if(!amcf->socket){
-        error=(u_char*)"Creating TCP socket";
+    
+    if (amcf->amqp_ssl) {
+      amcf->socket = amqp_ssl_socket_new(amcf->conn);
+      if (!amcf->socket) {
+        *error=(u_char*)"creating SSL/TLS socket";
         return -1;
+      }
+      amqp_ssl_socket_set_verify_peer(amcf->socket, amcf->amqp_ssl_verify_peer);
+      amqp_ssl_socket_set_verify_hostname(amcf->socket, amcf->amqp_ssl_verify_hostname);
+      amqp_status_enum ssl_status = amqp_ssl_socket_set_ssl_versions(amcf->socket, amcf->amqp_ssl_min_version, amcf->amqp_ssl_max_version);
+      
+      switch(ssl_status) {
+        case AMQP_STATUS_INVALID_PARAMETER : 
+            *error=(u_char*)"setting SSL protocol, min is higher than max";    
+            return -1;
+        case AMQP_STATUS_UNSUPPORTED :
+            *error=(u_char*)"setting SSL protocol, not supported";    
+            return -1;
+        default :
+            break;
+      }
+      
+      if(amcf->amqp_ssl_ca_certificate.len > 0) {
+        status = amqp_ssl_socket_set_cacert(amcf->socket, (char*)amcf->amqp_ssl_ca_certificate.data);
+        if (status) {
+          *error=(u_char*)"setting CA certificate";
+          return -1;
+        }
+      }
+      if(amcf->amqp_ssl_client_certificate.len > 0 && amcf->amqp_ssl_client_certificate_key.len > 0 ) {
+        status = amqp_ssl_socket_set_key(amcf->socket, (char*)amcf->amqp_ssl_client_certificate.data, (char*)amcf->amqp_ssl_client_certificate_key.data);
+        if (status) {
+          *error=(u_char*)"setting client certificate";
+          return -1;
+        }
+      }
+    } else {
+      amcf->socket=amqp_tcp_socket_new(amcf->conn);
+      if(!amcf->socket){
+          *error=(u_char*)"Creating TCP socket";
+          return -1;
+      }
     }
+    
     status=amqp_socket_open(amcf->socket, (char*)amcf->amqp_ip.data, (int)amcf->amqp_port);
     if(status){
-        error=(u_char*)"Opening TCP socket";
+        *error=(u_char*)"Opening TCP socket";
         return -1;
     }
     reply=amqp_login(amcf->conn, "/", 0, 131072, 0, AMQP_SASL_METHOD_PLAIN,(char*)amcf->amqp_user.data, (char*)amcf->amqp_password.data);
@@ -229,61 +347,46 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
     ngx_http_amqp_conf_t* amcf=ngx_http_get_module_loc_conf(r, ngx_http_amqp_module);
     ngx_chain_t out;
     ngx_buf_t* b;
-    ngx_str_t response;
     ngx_str_t messagebody;
     ngx_int_t rc;
-    u_char* empty_response;
 
-    u_char* msg;
-    u_char* msgbody;
-
-    ngx_uint_t init=amcf->init;
+    u_char* msg;    
 
     if(amcf->lengths==NULL){
         messagebody.data=ngx_palloc(r->pool, amcf->script_source.len);
         ngx_memcpy(messagebody.data, amcf->script_source.data, amcf->script_source.len);
         messagebody.len=amcf->script_source.len;
     }
-    else{
+    else{                                  
         if(ngx_http_script_run(r, &messagebody, amcf->lengths->elts, 0, amcf->values->elts)==NULL){
             return NGX_ERROR;
-        }
-
+        }  
     }
-    msgbody=ngx_pcalloc(r->pool, messagebody.len);
-    ngx_memcpy(msgbody, messagebody.data, messagebody.len);
-
+  
     msg=ngx_pcalloc(r->pool, 4096);
     if(!amcf->init){
         amcf->init=1;
-
-        if(connect_amqp(amcf, msg)<0) goto error;
+        if(connect_amqp(amcf, &msg)<0) goto error;
     }
-
+    
     amqp_basic_properties_t props;
 
     props._flags = AMQP_BASIC_CONTENT_TYPE_FLAG | AMQP_BASIC_DELIVERY_MODE_FLAG;
     props.content_type = amqp_cstring_bytes("text/plain");
     props.delivery_mode = 2;
-    if(get_error(amqp_basic_publish(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes((char*)amcf->amqp_queue.data), 0, 0, &props, amqp_cstring_bytes((char*)msgbody)), (u_char*)"Publishing", msg)){
+    if(get_error(amqp_basic_publish(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes((char*)amcf->amqp_routing_key.data), 0, 0, &props, amqp_cstring_bytes((char*)messagebody.data)), (u_char*)"Publishing", &msg)){
         syslog(LOG_WARNING, "Cannot publish. Try to republish.");
         memset(msg, 0, sizeof(msg)+1);
-        if(connect_amqp(amcf, msg)<0) goto error;
-        if(get_error(amqp_basic_publish(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes((char*)amcf->amqp_queue.data), 0, 0, &props, amqp_cstring_bytes((char*)msgbody)), (u_char*)"Publishing", msg)){
+        if(connect_amqp(amcf, &msg)<0) goto error;
+        if(get_error(amqp_basic_publish(amcf->conn, 1, amqp_cstring_bytes((char*)amcf->amqp_exchange.data), amqp_cstring_bytes((char*)amcf->amqp_routing_key.data), 0, 0, &props, amqp_cstring_bytes((char*)messagebody.data)), (u_char*)"Publishing", &msg)){
             goto error;
         }
 
     }
-    ngx_sprintf(msg, "NO ERROR init=%d", init);
-
+    ngx_sprintf(msg, "NO ERROR init=%d", amcf->init); 
 
     r->headers_out.content_type_len = sizeof("text/html") - 1;
     r->headers_out.content_type.data = (u_char *) "text/html";
-
-
-    response.data=ngx_palloc(r->pool, 4096);
-    ngx_sprintf(response.data, "%s::%s\nmessagebody: %s\n%s\n", amcf->amqp_exchange.data, amcf->amqp_queue.data, msgbody, msg);
-    response.len=ngx_strlen(response.data);
 
     b=ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
     if(b==NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
@@ -291,15 +394,15 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
     out.next=NULL;
 
     if(amcf->amqp_debug){
-        b->pos=response.data;
-        b->last=response.data+response.len;
-        r->headers_out.content_length_n=response.len;
+        b->pos=msg;
+        b->last=msg + ngx_strlen(msg);
+        r->headers_out.content_length_n=b->last - b->pos;
     }
     else{
-        empty_response=(u_char*)"\n";
-        b->pos=empty_response;
-        b->last=empty_response+sizeof(empty_response);
-        r->headers_out.content_length_n=sizeof(empty_response);
+        msg=(u_char*)"\n";
+        b->pos=msg;
+        b->last=msg+ngx_strlen(msg);
+        r->headers_out.content_length_n=sizeof(msg);
     }
     b->memory=1;
     b->last_buf=1;
@@ -317,24 +420,21 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
 ////////////////////////////////
     error:
     amcf->init=0;
-    response.data=ngx_palloc(r->pool, 1024);
-    ngx_sprintf(response.data, "Error: %s\n", msg);
-    response.len=ngx_strlen(response.data);
     b=ngx_pcalloc(r->pool, sizeof(ngx_buf_t));
     if(b==NULL) return NGX_HTTP_INTERNAL_SERVER_ERROR;
     out.buf=b;
     out.next=NULL;
 
     if(amcf->amqp_debug){
-        b->pos=response.data;
-        b->last=response.data+response.len;
-        r->headers_out.content_length_n=response.len;
+      b->pos=msg;
+      b->last=msg + ngx_strlen(msg);
+      r->headers_out.content_length_n=b->last - b->pos;
     }
     else{
-        empty_response=(u_char*)"Error!";
-        b->pos=empty_response;
-        b->last=empty_response+sizeof(empty_response);
-        r->headers_out.content_length_n=sizeof(empty_response);
+        msg=(u_char*)"Error!";
+        b->pos=msg;
+        b->last=msg + sizeof(msg);
+        r->headers_out.content_length_n=b->last - b->pos;
     }
     b->memory=1;
     b->last_buf=1;
@@ -345,11 +445,7 @@ ngx_int_t ngx_http_amqp_handler(ngx_http_request_t* r){
     if(rc==NGX_ERROR||rc>NGX_OK||r->header_only){
         return rc;
     }
-
     return ngx_http_output_filter(r, &out);
-
-
-
 }
 
 static char * ngx_http_amqp(ngx_conf_t *cf, ngx_command_t *cmd, void *conf){
@@ -402,6 +498,11 @@ static void* ngx_http_amqp_create_conf(ngx_conf_t *cf){
     }
 
     conf->amqp_debug=NGX_CONF_UNSET_UINT;
+    conf->amqp_ssl=NGX_CONF_UNSET_UINT;
+    conf->amqp_ssl_verify_peer=NGX_CONF_UNSET_UINT;
+    conf->amqp_ssl_verify_hostname=NGX_CONF_UNSET_UINT;
+    conf->amqp_ssl_min_version=NGX_CONF_UNSET_UINT;
+    conf->amqp_ssl_max_version=NGX_CONF_UNSET_UINT;
     conf->init=NGX_CONF_UNSET_UINT;
     conf->socket=NULL;
     conf->amqp_port=NGX_CONF_UNSET_UINT;
@@ -416,19 +517,37 @@ static char* ngx_http_amqp_merge_conf(ngx_conf_t *cf, void* parent, void* child)
     ngx_http_amqp_conf_t* prev=parent;
     ngx_http_amqp_conf_t* conf=child;
 
-
-
     ngx_conf_merge_str_value(conf->amqp_ip, prev->amqp_ip, "127.0.0.1");
     ngx_conf_merge_uint_value(conf->amqp_port, prev->amqp_port, 5672);
-    ngx_conf_merge_str_value(conf->amqp_exchange, prev->amqp_exchange, "rumExchange");
-    ngx_conf_merge_str_value(conf->amqp_queue, prev->amqp_queue, "rumQueue");
+    ngx_conf_merge_str_value(conf->amqp_exchange, prev->amqp_exchange, "defaultExchange");
+    ngx_conf_merge_str_value(conf->amqp_routing_key, prev->amqp_routing_key, "defaultRoutingKey");
     ngx_conf_merge_str_value(conf->amqp_user, prev->amqp_user, "guest");
     ngx_conf_merge_str_value(conf->amqp_password, prev->amqp_password, "guest");
     ngx_conf_merge_uint_value(conf->init, prev->init, 0);
     ngx_conf_merge_uint_value(conf->amqp_debug, prev->amqp_debug, 0);
+    ngx_conf_merge_uint_value(conf->amqp_ssl, prev->amqp_ssl, 0);
+    ngx_conf_merge_uint_value(conf->amqp_ssl_verify_peer, prev->amqp_ssl_verify_peer, 0);
+    ngx_conf_merge_uint_value(conf->amqp_ssl_verify_hostname, prev->amqp_ssl_verify_hostname, 0);
+    ngx_conf_merge_str_value(conf->amqp_ssl_ca_certificate, prev->amqp_ssl_ca_certificate, "");
+    ngx_conf_merge_str_value(conf->amqp_ssl_client_certificate, prev->amqp_ssl_client_certificate, "");
+    ngx_conf_merge_str_value(conf->amqp_ssl_client_certificate_key, prev->amqp_ssl_client_certificate_key, "");
+    ngx_conf_merge_uint_value(conf->amqp_ssl_min_version, prev->amqp_ssl_min_version, AMQP_TLSv1_1);
+    ngx_conf_merge_uint_value(conf->amqp_ssl_max_version, prev->amqp_ssl_max_version, AMQP_TLSvLATEST);
 
-
-
+    if(conf->amqp_ssl)  {
+      if (conf->amqp_ssl_client_certificate.len == 0 && conf->amqp_ssl_client_certificate_key.len > 0 ) {
+          ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                        "no amqp_ssl_client_certificate provided");
+          return NGX_CONF_ERROR;
+      }
+      
+      if (conf->amqp_ssl_client_certificate_key.len == 0 && conf->amqp_ssl_client_certificate.len > 0 ) {
+          ngx_log_error(NGX_LOG_EMERG, cf->log, 0,
+                        "no amqp_ssl_client_certificate_key provided");
+          return NGX_CONF_ERROR;
+      }
+    }
+    
     return NGX_CONF_OK;
 }
 static void ngx_http_amqp_exit(ngx_cycle_t* cycle){
